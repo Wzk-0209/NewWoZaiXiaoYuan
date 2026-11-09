@@ -13,6 +13,19 @@ UA = ('Mozilla/5.0 (Linux; Android 10; WLZ-AN00 Build/HUAWEIWLZ-AN00; wv) AppleW
       'MicroMessenger/8.0.28.2240(0x28001C35) WeChat/arm64 Weixin NetType/WIFI Language/zh_CN ABI/arm64 '
       'miniProgram/wxce6d08f781975d91')
 
+# ==================== 打卡坐标（不再调用腾讯地图）====================
+# 呈贡校区怡园内的坐标，取自你历史打卡记录
+PUNCH_LAT = 24.856775
+PUNCH_LON = 102.858358
+PROVINCE = "云南省"
+CITY = "昆明市"
+DISTRICT = "呈贡区"
+ADCODE = "530114"
+TOWNCODE = "530114005"
+TOWNSHIP = "吴家营街道"
+STREET = "樱花大道"
+# =====================================================================
+
 
 def MsgSend(title, info):
     if os.environ.get('mail_address') and os.environ.get('mail_password'):
@@ -58,46 +71,62 @@ def Login(username, password):
     text = json.loads(req.text)
     if text.get('code') == 0:
         print(f"{username}账号登陆成功！")
-        jws = re.search(r'JWSESSION=(.*?);', str(req.headers.get('Set-Cookie'))).group(1)
-        return jws
+        return re.search(r'JWSESSION=(.*?);', str(req.headers.get('Set-Cookie'))).group(1)
     print(f"{username}登陆失败，请检查账号密码！{req.text}")
     return False
 
 
-def get_logs(headers):
-    url = f"{API}/sign/mobile/receive/getMySignLogs"
-    resp = requests.get(url, headers=headers, params={'page': 1, 'size': 10})
-    print("DEBUG_LOGS_RAW=", resp.text)
-    return resp.json()
+def point_in_polygon(lon, lat, poly):
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]['longitude'], poly[i]['latitude']
+        xj, yj = poly[j]['longitude'], poly[j]['latitude']
+        if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
 
 
-def get_punch_data(location, tencentKey, area):
-    geocode = requests.get("https://apis.map.qq.com/ws/geocoder/v1",
-                           params={"address": location, "key": tencentKey}).json()
-    if geocode.get('status') != 0:
-        print("DEBUG_GEOCODE_FAIL=", geocode)
-        return None
-    loc = geocode['result']['location']
-    rev = requests.get("https://apis.map.qq.com/ws/geocoder/v1",
-                       params={"location": f"{loc['lat']},{loc['lng']}", "key": tencentKey}).json()
-    if rev.get('status') != 0:
-        print("DEBUG_REVGEOCODE_FAIL=", rev)
-        return None
-    d = rev['result']
+def build_area(data):
+    """从任务的 areaList 里取出自己宿舍区的多边形"""
+    user_area = data.get('userArea')
+    for item in (data.get('areaList') or []):
+        if item.get('name') != user_area:
+            continue
+        if item.get('dataStr'):
+            poly = json.loads(item['dataStr'])
+        elif isinstance(item.get('data'), list):
+            poly = item['data']
+        else:
+            return None
+        return {"type": 1, "polygon": poly, "id": item['id'], "name": item['name']}
+    return None
+
+
+def build_punch_data(area):
+    lat, lon = PUNCH_LAT, PUNCH_LON
+    # 如果写死的坐标不在本次打卡区域内（比如换了宿舍区），自动改用该区域中心点
+    if area and not point_in_polygon(lon, lat, area['polygon']):
+        poly = area['polygon']
+        lon = round(sum(p['longitude'] for p in poly) / len(poly), 6)
+        lat = round(sum(p['latitude'] for p in poly) / len(poly), 6)
+        print(f"坐标不在 {area['name']} 区域内，改用区域中心点 {lat},{lon}")
     punch = {
-        "latitude": d['location']['lat'],
-        "longitude": d['location']['lng'],
+        "latitude": lat,
+        "longitude": lon,
         "nationcode": "",
         "country": "中国",
-        "province": d['ad_info']['province'],
+        "province": PROVINCE,
         "citycode": "",
-        "city": d['ad_info']['city'],
-        "adcode": d['ad_info']['adcode'],
-        "district": d['ad_info']['district'],
-        "towncode": d['address_reference']['town']['id'],
-        "township": d['address_reference']['town']['title'],
+        "city": CITY,
+        "adcode": ADCODE,
+        "district": DISTRICT,
+        "towncode": TOWNCODE,
+        "township": TOWNSHIP,
         "streetcode": "",
-        "street": d['address_component']['street'],
+        "street": STREET,
         "inArea": 1,
     }
     if area:
@@ -105,36 +134,22 @@ def get_punch_data(location, tencentKey, area):
     return punch
 
 
-def try_punch(headers, username, sign_id, item_id, punch, area):
+def do_punch(headers, username, sign_id, item_id, punch):
     h = dict(headers)
     h['Referer'] = 'https://servicewechat.com/wxce6d08f781975d91/200/page-frame.html'
     params = {'id': item_id, 'schoolId': school_id, 'signId': sign_id}
-    attempts = [
-        ("A_doSignByArea_areaJSON字符串", f"{API}/sign/mobile/receive/doSignByArea", punch, "punch"),
-        ("B_doSignByArea_areaJSON对象", f"{API}/sign/mobile/receive/doSignByArea", punch, "obj"),
-        ("C_doSignByLocation_带areaJSON", f"{API}/sign/mobile/receive/doSignByLocation", punch, "punch"),
-        ("D_doSignByLocation_不带areaJSON", f"{API}/sign/mobile/receive/doSignByLocation", punch, "plain"),
-    ]
-    for name, url, body, mode in attempts:
-        data = dict(body)
-        if mode == "obj" and area:
-            data["areaJSON"] = area
-        if mode == "plain":
-            data.pop("areaJSON", None)
+    for name, url in (("doSignByArea", f"{API}/sign/mobile/receive/doSignByArea"),
+                      ("doSignByLocation", f"{API}/sign/mobile/receive/doSignByLocation")):
         try:
-            res = requests.post(url, data=json.dumps(data), headers=h, params=params)
-            print(f"DEBUG_{name}_REQ=", json.dumps(data, ensure_ascii=False)[:1500])
-            print(f"DEBUG_{name}_RESP=", res.text)
-            txt = json.loads(res.text)
+            res = requests.post(url, data=json.dumps(punch), headers=h, params=params)
+            print(f"[{name}] {res.text}")
+            if json.loads(res.text).get('code') == 0:
+                print(f"{username}打卡成功！方式={name}\n")
+                MsgSend("打卡成功！", f"{username}归寝打卡成功！方式={name}")
+                return True
         except Exception as e:
-            print(f"DEBUG_{name}_ERR=", type(e).__name__, str(e))
-            continue
-        if txt.get('code') == 0:
-            print(f"{username}打卡成功！方式={name}\n")
-            MsgSend("打卡成功！", f"{username}归寝打卡成功！方式={name}")
-            return True
-        print(f"{name} 失败：{res.text}")
-    MsgSend("打卡失败！", f"{username}归寝打卡失败，四种方式均被拒绝，请查看 Actions 日志")
+            print(f"[{name}] 请求异常：{type(e).__name__} {e}")
+    MsgSend("打卡失败！", f"{username}归寝打卡失败，请到 Actions 查看日志")
     return False
 
 
@@ -142,11 +157,11 @@ def main():
     global school_id
     username = os.environ['wzxy_username']
     school_id = get_school_id(os.environ.get('school_name'))
-    print("DEBUG_SCHOOL_ID=", school_id)
     jws = Login(username, os.environ['wzxy_password'])
     if not jws:
         MsgSend("登陆失败！", f"{username} 登陆失败")
         return False
+
     headers = {
         'Host': 'gw.wozaixiaoyuan.com',
         'Connection': 'keep-alive',
@@ -163,39 +178,24 @@ def main():
         'Accept-Encoding': 'gzip, deflate',
         'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7'
     }
-    logs = get_logs(headers)
+
+    resp = requests.get(f"{API}/sign/mobile/receive/getMySignLogs", headers=headers,
+                        params={'page': 1, 'size': 10}).json()
     try:
-        data = logs['data'][0]
+        data = resp['data'][0]
     except Exception:
-        print("DEBUG_NO_TASK=", json.dumps(logs, ensure_ascii=False)[:800])
+        print("没有查到打卡任务：", resp)
         return False
+
     if int(data.get('signStatus', 0)) != 1:
-        print("用户已打过卡！signStatus=", data.get('signStatus'))
+        print(f"用户已打过卡！signStatus={data.get('signStatus')}（2=已打）")
         return False
 
-    sign_id, item_id = data.get('signId'), data.get('id')
-    user_area, area_list = data.get('userArea'), data.get('areaList') or []
-    print("DEBUG_KEYS=", list(data.keys()))
-    print("DEBUG_USER_AREA=", user_area, "AREA_N=", len(area_list))
-
-    area = None
-    for _ in area_list:
-        if user_area == _['name']:
-            dataStr = _['dataStr'] if ('dataStr' in _) else (
-                '[{"longitude": %s, "latitude": %s}]' % (_['longitude'], _['latitude']))
-            try:
-                polygon = json.loads(dataStr)
-            except Exception:
-                polygon = dataStr
-            area = {"type": 1, "polygon": polygon, "id": _['id'], "name": _['name']}
-            break
-    print("DEBUG_AREA=", json.dumps(area, ensure_ascii=False)[:1200] if area else "未匹配到 userArea")
-
-    punch = get_punch_data(os.environ['punch_location'], os.environ['tencentKey'], area)
-    if punch is None:
-        return False
-    print("DEBUG_PUNCH_BASE=", json.dumps(punch, ensure_ascii=False)[:1200])
-    return try_punch(headers, username, sign_id, item_id, punch, area)
+    area = build_area(data)
+    print(f"打卡区域={data.get('userArea')} areaId={data.get('areaId')} 区域数据={'有' if area else '无'}")
+    punch = build_punch_data(area)
+    print("提交数据=", json.dumps(punch, ensure_ascii=False)[:600])
+    return do_punch(headers, username, data['signId'], data['id'], punch)
 
 
 if __name__ == "__main__":
